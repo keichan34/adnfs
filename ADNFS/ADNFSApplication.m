@@ -10,9 +10,6 @@
 
 #import <ADNKit/ADNKit.h>
 
-static const char *hello_str = "Hello World!\n";
-static const char *hello_path = "/hello.txt";
-
 static int adnfs_getattr(const char *path, struct stat *stbuf) {
     return [[ADNFSApplication sharedApplication] getAttrWithPath:path stat:stbuf];
 }
@@ -49,10 +46,16 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
 
 @property (nonatomic, strong) ANKClient *client;
 
+- (NSString *) nextFilenameForFilename:(NSString *) originalFilename;
+
 @end
 
 @implementation ADNFSApplication {
+    /** Key: File ID, Object: ANKFile */
     NSMutableDictionary *_cachedFiles;
+
+    /** Key: Filename, object: File ID */
+    NSMutableDictionary *_sparseFileMap;
     
     dispatch_queue_t fuseQueue;
 }
@@ -87,7 +90,8 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
         stbuf->st_mode = S_IFDIR | 0755;
         stbuf->st_nlink = 2;
     } else if (pathComponents.count == 2 && pathComponents[1]) {
-        ANKFile *file = _cachedFiles[pathComponents[1]];
+        NSString *fileID = _sparseFileMap[pathComponents[1]];
+        ANKFile *file = _cachedFiles[fileID];
         if (file) {
             stbuf->st_mode = S_IFREG | 0444;
             stbuf->st_nlink = 1;
@@ -120,7 +124,7 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
     filler(buf, ".", NULL, 0);
 	filler(buf, "..", NULL, 0);
     
-    for (NSString *filename in _cachedFiles) {
+    for (NSString *filename in _sparseFileMap) {
         filler(buf, filename.UTF8String, NULL, 0);
     }
     
@@ -146,9 +150,12 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
 {
     size_t len;
     (void) fi;
-    if(strcmp(path, hello_path) != 0)
-        return -ENOENT;
     
+    // if(strcmp(path, hello_path) != 0)
+    
+    return -ENOENT;
+    
+    /*
     len = strlen(hello_str);
     if (offset < len) {
         if (offset + size > len)
@@ -156,12 +163,13 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
         memcpy(buf, hello_str + offset, size);
     } else
         size = 0;
+    */
     
     return (int)size;
 }
 
-- (void) runWithArgc:(int) argc
-                argv:(char *[])argv
+- (void) runWithArgc:(int) _argc
+                argv:(char *[])_argv
 {
     
     static struct fuse_operations adnfs_oper = {
@@ -170,15 +178,21 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
         .open		= adnfs_open,
         .read		= adnfs_read,
     };
-    
-    if (argc >= 1) {
-        char * mountPath = argv[1];
-        
-        mkdir(mountPath, 0700);
+
+    int argc = _argc + 1;
+    char ** argv = malloc(sizeof(char *) * argc);
+
+    for (int i = 0; i <= _argc; i++) {
+        int use = i;
+        if (i == 0) {
+            use--;
+        }
+        argv[use + 1] = _argv[i];
     }
 
     fuseQueue = dispatch_queue_create("us.kkob.FuseQueue", NULL);
-    _cachedFiles = @{}.mutableCopy;
+    _cachedFiles = [NSMutableDictionary dictionary];
+    _sparseFileMap = [NSMutableDictionary dictionary];
     
     // Let's take the opportunity to authenticate with ADN now.
     self.client = [[ANKClient alloc] init];
@@ -192,12 +206,24 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
                            completion:
      ^(BOOL succeeded, ANKAPIResponseMeta *meta, NSError *error) {
          if (succeeded) {
+             NSString *theMountpoint = [NSString stringWithFormat:@"/Volumes/@%@", self.client.authenticatedUser.username];
+             char * mountpoint = malloc(sizeof(char) * (strlen(theMountpoint.UTF8String) + 1));
+
+             strlcpy(mountpoint, theMountpoint.UTF8String, strlen(theMountpoint.UTF8String) + 1);
+
+             mkdir(mountpoint, 0700);
+
+             argv[1] = mountpoint;
+
              dispatch_async(fuseQueue, ^{
                  [self preloadAllFiles];
                  
                  NSLog(@"Mounting...");
                  fuse_main(argc, argv, &adnfs_oper, NULL);
-                 
+
+                 free(mountpoint);
+                 free(argv);
+
                  NSLog(@"FUSE is done!");
              });
          } else {
@@ -221,7 +247,10 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
          ^(id responseObject, ANKAPIResponseMeta *meta, NSError *error) {
              NSArray *files = responseObject;
              for (ANKFile *file in files) {
-                 _cachedFiles[file.name] = file;
+                 _cachedFiles[file.fileID] = file;
+
+                 NSString *newFilename = [self nextFilenameForFilename:file.name];
+                 _sparseFileMap[newFilename] = file.fileID;
              }
              
              currentClient.pagination.beforeID = meta.minID;
@@ -232,6 +261,50 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
         
         dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
     }
+}
+
+- (NSString *) nextFilenameForFilename:(NSString *) originalFilename {
+    if (![_sparseFileMap.allKeys containsObject:originalFilename]) {
+        return originalFilename;
+    }
+
+    NSString *fileName = originalFilename;
+    NSString *fileExtension = fileName.pathExtension;
+    fileName = fileName.stringByDeletingPathExtension;
+
+    static NSRegularExpression *regex = nil;
+
+    if (!regex) {
+        NSError *error = nil;
+
+        regex =
+        [NSRegularExpression regularExpressionWithPattern:@"-(\\d+)$"
+                                                  options:NSRegularExpressionCaseInsensitive
+                                                    error:&error];
+    }
+
+    NSTextCheckingResult *result =
+    [regex firstMatchInString:fileName
+                      options:0
+                        range:NSMakeRange(0, fileName.length)];
+
+    if (result) {
+
+        NSString *oldNumber = [fileName substringWithRange:[result rangeAtIndex:1]];
+        NSInteger theNumber = oldNumber.integerValue;
+        theNumber ++;
+
+        fileName = [fileName stringByReplacingCharactersInRange:result.range withString:[NSString stringWithFormat:@"-%ld", (long)theNumber]];
+
+    } else {
+
+        fileName = [fileName stringByAppendingString:@"-1"];
+
+    }
+
+    fileName = [fileName stringByAppendingPathExtension:fileExtension];
+
+    return [self nextFilenameForFilename:fileName];
 }
 
 @end
