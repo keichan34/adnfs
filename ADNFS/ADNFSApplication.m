@@ -66,6 +66,9 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
 
     /** Current status. */
     ANKTokenStatus *_cachedTokenStatus;
+    
+    /** Cached file data. */
+    NSMutableDictionary *_cachedFileData;
 
     dispatch_queue_t fuseQueue;
 }
@@ -126,9 +129,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
     (void) offset;
 	(void) fi;
     
-    NSString *path = [NSString stringWithUTF8String:_path];
-    
-	if (![path isEqualToString:@"/"])
+	if (strcmp(_path, "/") != 0)
 		return -ENOENT;
     
     filler(buf, ".", NULL, 0);
@@ -164,7 +165,6 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
           offset:(off_t)offset
               fi:(struct fuse_file_info *)fi
 {
-    size_t len;
     (void) fi;
 
     NSString *path = [NSString stringWithUTF8String:_path];
@@ -174,18 +174,53 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
     if (![_sparseFileMap objectForKey:filename])
         return -ENOENT;
 
-    /*
-     ANKFile *file = _cachedFiles[_sparseFileMap[filename]];
-    len = file.sizeBytes;
-
-    if (offset < len) {
-        if (offset + size > len) {
-            size = len - offset;
+    ANKFile *file = _cachedFiles[_sparseFileMap[filename]];
+    
+    size_t _size = size;
+    
+    NSData * __block fileData = nil;
+    
+    if (!(fileData = _cachedFileData[file.fileID])) {
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+        
+        NSURL *url = file.URL;
+        
+        NSURLRequest *request = [NSURLRequest requestWithURL:url];
+        AFHTTPRequestOperation *op = [[AFHTTPRequestOperation alloc] initWithRequest:request];
+        
+        [op setCompletionBlockWithSuccess:^(AFHTTPRequestOperation *operation, id responseObject) {
+            NSData *response = responseObject;
+            
+            _cachedFileData[file.fileID] = response;
+            fileData = response;
+            
+            dispatch_semaphore_signal(semaphore);
+        } failure:^(AFHTTPRequestOperation *operation, NSError *error) {
+            NSLog(@"File fetch error: %@", error);
+            
+            dispatch_semaphore_signal(semaphore);
+        }];
+        
+        [op start];
+        
+        dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+        
+    }
+    
+    if (fileData) {
+        
+        if (offset < fileData.length) {
+            if (offset + size > fileData.length)
+                _size = fileData.length - offset;
+            
+            [fileData getBytes:buf range:NSMakeRange(offset, _size)];
         }
-
-    } else
-        size = 0;
-    */
+        
+    } else {
+        // Error
+        _size = 0;
+    }
+    
     /*
     len = strlen(hello_str);
     if (offset < len) {
@@ -196,7 +231,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
         size = 0;
     */
     
-    return (int)0;
+    return (int)_size;
 }
 
 - (int) statfs:(const char *)path
@@ -251,6 +286,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
     fuseQueue = dispatch_queue_create("us.kkob.FuseQueue", NULL);
     _cachedFiles = [NSMutableDictionary dictionary];
     _sparseFileMap = [NSMutableDictionary dictionary];
+    _cachedFileData = [NSMutableDictionary dictionary];
     
     // Let's take the opportunity to authenticate with ADN now.
     self.client = [[ANKClient alloc] init];

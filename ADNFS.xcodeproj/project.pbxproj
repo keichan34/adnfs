@@ -319,7 +319,6 @@
 					SystemConfiguration,
 					"-L/usr/local/lib",
 					"-losxfuse",
-					"-pthread",
 					"-liconv",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -346,7 +345,6 @@
 					SystemConfiguration,
 					"-L/usr/local/lib",
 					"-losxfuse",
-					"-pthread",
 					"-liconv",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
