@@ -42,6 +42,13 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
                                                        fi:fi];
 }
 
+static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
+
+    return [[ADNFSApplication sharedApplication] statfs:path
+                                                  stbuf:stbuf];
+
+}
+
 @interface ADNFSApplication ()
 
 @property (nonatomic, strong) ANKClient *client;
@@ -56,7 +63,10 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
 
     /** Key: Filename, object: File ID */
     NSMutableDictionary *_sparseFileMap;
-    
+
+    /** Current status. */
+    ANKTokenStatus *_cachedTokenStatus;
+
     dispatch_queue_t fuseQueue;
 }
 
@@ -135,14 +145,20 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
               fi:(struct fuse_file_info *)fi
 {
     NSString *path = [NSString stringWithUTF8String:_path];
-    
+
     if ((fi->flags & 3) != O_RDONLY)
         return -EACCES;
-    
+
+    NSArray *pathComponents = path.pathComponents;
+    NSString *filename = pathComponents.lastObject;
+
+    if (![_sparseFileMap objectForKey:filename])
+        return -ENOENT;
+
     return 0;
 }
 
-- (int) readPath:(const char *)path
+- (int) readPath:(const char *)_path
              buf:(char *)buf
             size:(size_t)size
           offset:(off_t)offset
@@ -150,11 +166,26 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
 {
     size_t len;
     (void) fi;
-    
-    // if(strcmp(path, hello_path) != 0)
-    
-    return -ENOENT;
-    
+
+    NSString *path = [NSString stringWithUTF8String:_path];
+    NSArray *pathComponents = path.pathComponents;
+    NSString *filename = pathComponents.lastObject;
+
+    if (![_sparseFileMap objectForKey:filename])
+        return -ENOENT;
+
+    /*
+     ANKFile *file = _cachedFiles[_sparseFileMap[filename]];
+    len = file.sizeBytes;
+
+    if (offset < len) {
+        if (offset + size > len) {
+            size = len - offset;
+        }
+
+    } else
+        size = 0;
+    */
     /*
     len = strlen(hello_str);
     if (offset < len) {
@@ -165,7 +196,30 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
         size = 0;
     */
     
-    return (int)size;
+    return (int)0;
+}
+
+- (int) statfs:(const char *)path
+         stbuf:(struct statvfs *) stbuf
+{
+    unsigned int blocksize = 2048;
+
+    stbuf->f_bsize = stbuf->f_frsize = blocksize;
+
+    ANKStorage *storage = _cachedTokenStatus.storage;
+
+    stbuf->f_blocks = (fsblkcnt_t)((storage.available + storage.used) / blocksize);
+    stbuf->f_bfree = (fsblkcnt_t)(storage.available / blocksize);
+    stbuf->f_bavail = (fsblkcnt_t)(storage.available / blocksize);
+
+    stbuf->f_files = (fsblkcnt_t)_sparseFileMap.count;
+    stbuf->f_favail = INT_MAX;
+
+    stbuf->f_namemax = 255;
+
+    stbuf->f_flag = 0;
+
+    return 0;
 }
 
 - (void) runWithArgc:(int) _argc
@@ -177,18 +231,22 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
         .readdir	= adnfs_readdir,
         .open		= adnfs_open,
         .read		= adnfs_read,
+        .statfs     = adnfs_statfs,
     };
 
-    int argc = _argc + 1;
+    int argc = _argc + 3;
     char ** argv = malloc(sizeof(char *) * argc);
+    memset(argv, 0, sizeof(char *) * argc);
 
     for (int i = 0; i <= _argc; i++) {
         int use = i;
         if (i == 0) {
-            use--;
+            use -= 3;
         }
-        argv[use + 1] = _argv[i];
+        argv[use + 3] = _argv[i];
     }
+
+    argv[2] = "-o";
 
     fuseQueue = dispatch_queue_create("us.kkob.FuseQueue", NULL);
     _cachedFiles = [NSMutableDictionary dictionary];
@@ -206,25 +264,33 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
                            completion:
      ^(BOOL succeeded, ANKAPIResponseMeta *meta, NSError *error) {
          if (succeeded) {
-             NSString *theMountpoint = [NSString stringWithFormat:@"/Volumes/@%@", self.client.authenticatedUser.username];
+             NSString *theMountpoint = [NSString stringWithFormat:@"/Volumes/%@", self.client.authenticatedUser.username];
              char * mountpoint = malloc(sizeof(char) * (strlen(theMountpoint.UTF8String) + 1));
-
              strlcpy(mountpoint, theMountpoint.UTF8String, strlen(theMountpoint.UTF8String) + 1);
 
              mkdir(mountpoint, 0700);
 
              argv[1] = mountpoint;
 
+             NSString *theMountpointName = [NSString stringWithFormat:@"volname=ADN Files (@%@)", self.client.authenticatedUser.username];
+             char * mountpointName = malloc(sizeof(char) * (strlen(theMountpointName.UTF8String) + 1));
+             strlcpy(mountpointName, theMountpointName.UTF8String, strlen(theMountpointName.UTF8String) + 1);
+
+             argv[3] = mountpointName;
+
              dispatch_async(fuseQueue, ^{
                  [self preloadAllFiles];
+                 [self preloadConfiguration];
                  
                  NSLog(@"Mounting...");
                  fuse_main(argc, argv, &adnfs_oper, NULL);
 
                  free(mountpoint);
+                 free(mountpointName);
                  free(argv);
 
                  NSLog(@"FUSE is done!");
+                 exit(0);
              });
          } else {
              NSLog(@"Hm. The access token was rejected: %@", error.description);
@@ -247,6 +313,8 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
          ^(id responseObject, ANKAPIResponseMeta *meta, NSError *error) {
              NSArray *files = responseObject;
              for (ANKFile *file in files) {
+                 if (!file.isComplete) continue;
+
                  _cachedFiles[file.fileID] = file;
 
                  NSString *newFilename = [self nextFilenameForFilename:file.name];
@@ -261,6 +329,21 @@ static int adnfs_read(const char *path, char *buf, size_t size, off_t offset,
         
         dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
     }
+}
+
+- (void) preloadConfiguration {
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+
+    [self.client fetchTokenStatusForCurrentUserWithCompletion:
+     ^(id responseObject, ANKAPIResponseMeta *meta, NSError *error) {
+         ANKTokenStatus *status = responseObject;
+
+         _cachedTokenStatus = status;
+
+         dispatch_semaphore_signal(semaphore);
+     }];
+
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
 }
 
 - (NSString *) nextFilenameForFilename:(NSString *) originalFilename {
