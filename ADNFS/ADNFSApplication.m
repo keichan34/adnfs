@@ -9,6 +9,7 @@
 #import "ADNFSApplication.h"
 
 #import <ADNKit/ADNKit.h>
+#import <SSKeychain.h>
 
 static int adnfs_getattr(const char *path, struct stat *stbuf) {
     return [[ADNFSApplication sharedApplication] getAttrWithPath:path stat:stbuf];
@@ -22,6 +23,13 @@ static int adnfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                                                           filler:filler
                                                           offset:offset
                                                               fi:fi];
+    
+}
+
+static int adnfs_access(const char *path, int mask) {
+    
+    return [[ADNFSApplication sharedApplication] checkAccessPath:path
+                                                            mask:mask];
     
 }
 
@@ -142,6 +150,24 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
 	return 0;
 }
 
+- (int) checkAccessPath:(const char *)_path
+                   mask:(int) mask {
+    
+    NSString *path = [NSString stringWithUTF8String:_path];
+    
+    if ([path isEqualToString:@"/"]) {
+        return 0;
+    }
+    
+    NSString *filename = path.lastPathComponent;
+    
+    if (_sparseFileMap[filename]) {
+        return 0;
+    }
+    
+    return -ENOENT;
+}
+
 - (int) openPath:(const char *)_path
               fi:(struct fuse_file_info *)fi
 {
@@ -208,7 +234,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
         
     }
     
-    if (fileData) {
+    if (fileData || fileData.isContentDiscarded) {
         
         if (offset < fileData.length) {
             if (offset + size > fileData.length)
@@ -255,6 +281,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
     static struct fuse_operations adnfs_oper = {
         .getattr	= adnfs_getattr,
         .readdir	= adnfs_readdir,
+        // .access     = adnfs_access,
         .open		= adnfs_open,
         .read		= adnfs_read,
         .statfs     = adnfs_statfs,
@@ -287,13 +314,62 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
     NSString *accessToken = nil;
 #ifdef MANUAL_ACCESS_TOKEN
     accessToken = MANUAL_ACCESS_TOKEN;
+#else
+#ifdef CLIENT_ID
+    
+    NSError *clientFetchError = nil;
+    accessToken = [SSKeychain passwordForService:@"us.kkob.ADNFS"
+                                         account:@"defaultUser"
+                                           error:&clientFetchError];
+    
+    if (clientFetchError) {
+        
+        NSURLRequest *request =
+        [self.client webAuthRequestForClientID:CLIENT_ID
+                                   redirectURI:@"https://kkob.us/adnfs/token.html"
+                                    authScopes:(ANKAuthScopeFiles | ANKAuthScopeBasic)
+                                         state:nil
+                                  responseType:@"token"
+                             appStoreCompliant:NO];
+        
+        [[NSWorkspace sharedWorkspace] openURL:request.URL];
+        
+        printf("Once you have given ADNFS access to your files,\n");
+        printf("copy and paste the Access Token below: \n\n");
+        
+        char * line = NULL;
+        size_t linecap = 0;
+        ssize_t line_len = 0;
+        
+        line_len = getline(&line, &linecap, stdin);
+        
+        if (line_len > 0) {
+            accessToken = [NSString stringWithUTF8String:line];
+            accessToken = [accessToken stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        }
+        
+        free(line);
+        
+    }
+    
+#else
+#error Either a CLIENT_ID or MANUAL_ACCESS_TOKEN is required.
+#endif
 #endif
     
     [self.client logInWithAccessToken:accessToken
                            completion:
      ^(BOOL succeeded, ANKAPIResponseMeta *meta, NSError *error) {
          if (succeeded) {
-             NSString *theMountpoint = [NSString stringWithFormat:@"/Volumes/%@", self.client.authenticatedUser.username];
+             printf("Great! Loading your files...\n");
+             
+             [SSKeychain setPassword:accessToken
+                          forService:@"us.kkob.ADNFS"
+                             account:@"defaultUser"];
+             
+             NSString *username = self.client.authenticatedUser.username;
+             
+             NSString *theMountpoint = [NSString stringWithFormat:@"/Volumes/%@", username];
              char * mountpoint = malloc(sizeof(char) * (strlen(theMountpoint.UTF8String) + 1));
              strlcpy(mountpoint, theMountpoint.UTF8String, strlen(theMountpoint.UTF8String) + 1);
 
@@ -301,7 +377,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
 
              argv[1] = mountpoint;
 
-             NSString *theMountpointName = [NSString stringWithFormat:@"volname=ADN Files (@%@)", self.client.authenticatedUser.username];
+             NSString *theMountpointName = [NSString stringWithFormat:@"volname=ADN Files (@%@)", username];
              char * mountpointName = malloc(sizeof(char) * (strlen(theMountpointName.UTF8String) + 1));
              strlcpy(mountpointName, theMountpointName.UTF8String, strlen(theMountpointName.UTF8String) + 1);
 
@@ -311,7 +387,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
                  [self preloadAllFiles];
                  [self preloadConfiguration];
                  
-                 NSLog(@"Mounting...");
+                 printf("Mounting '%s'. I'm going to exit now, unmount the volume to kill me.", username.UTF8String);
                  fuse_main(argc, argv, &adnfs_oper, NULL);
 
                  free(mountpoint);
@@ -323,6 +399,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
              });
          } else {
              NSLog(@"Hm. The access token was rejected: %@", error.description);
+             exit(1);
          }
      }];
 }
@@ -376,7 +453,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
 }
 
 - (NSString *) nextFilenameForFilename:(NSString *) originalFilename {
-    if (![_sparseFileMap.allKeys containsObject:originalFilename]) {
+    if (!_sparseFileMap[originalFilename]) {
         return originalFilename;
     }
 
