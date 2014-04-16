@@ -68,7 +68,7 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
     ANKTokenStatus *_cachedTokenStatus;
     
     /** Cached file data. */
-    NSMutableDictionary *_cachedFileData;
+    NSCache *_cachedFileData;
 
     dispatch_queue_t fuseQueue;
 }
@@ -179,8 +179,8 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
     size_t _size = size;
     
     NSData * __block fileData = nil;
-    
-    if (!(fileData = _cachedFileData[file.fileID])) {
+
+    if (!(fileData = [_cachedFileData objectForKey:file.fileID])) {
         dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
         
         NSURL *url = file.URL;
@@ -189,9 +189,10 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
         AFHTTPRequestOperation *op = [[AFHTTPRequestOperation alloc] initWithRequest:request];
         
         [op setCompletionBlockWithSuccess:^(AFHTTPRequestOperation *operation, id responseObject) {
-            NSData *response = responseObject;
-            
-            _cachedFileData[file.fileID] = response;
+            NSPurgeableData *response = [NSPurgeableData dataWithData:responseObject];
+
+            [_cachedFileData setObject:response forKey:file.fileID cost:response.length];
+
             fileData = response;
             
             dispatch_semaphore_signal(semaphore);
@@ -220,16 +221,6 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
         // Error
         _size = 0;
     }
-    
-    /*
-    len = strlen(hello_str);
-    if (offset < len) {
-        if (offset + size > len)
-            size = len - offset;
-        memcpy(buf, hello_str + offset, size);
-    } else
-        size = 0;
-    */
     
     return (int)_size;
 }
@@ -286,7 +277,9 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
     fuseQueue = dispatch_queue_create("us.kkob.FuseQueue", NULL);
     _cachedFiles = [NSMutableDictionary dictionary];
     _sparseFileMap = [NSMutableDictionary dictionary];
-    _cachedFileData = [NSMutableDictionary dictionary];
+    _cachedFileData = [[NSCache alloc] init];
+    _cachedFileData.countLimit = 100;
+    _cachedFileData.totalCostLimit = 52428800; // 50 MB
     
     // Let's take the opportunity to authenticate with ADN now.
     self.client = [[ANKClient alloc] init];
