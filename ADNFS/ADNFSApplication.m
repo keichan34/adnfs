@@ -178,9 +178,9 @@ static int adnfs_statfs(const char *path, struct statvfs *stbuf) {
     
     size_t _size = size;
     
-    NSData * __block fileData = nil;
+    NSPurgeableData * __block fileData = nil;
 
-    if (!(fileData = [_cachedFileData objectForKey:file.fileID])) {
+    if (!(fileData = [_cachedFileData objectForKey:file.fileID]) || fileData.isContentDiscarded) {
         dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
         
         NSURL *url = file.URL;
